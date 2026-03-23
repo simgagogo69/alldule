@@ -11071,7 +11071,7 @@ function toggleModifier(id){
 let diffMults = {
     enemyDmg:1, enemyHP:1, enemySpeed:1,
     shopCost:1, playerHPMult:1, playerDmgPenalty:1,
-    boostDrain:1, scrapMult:1, moduleDropMult:1,
+    boostDrain:1, scrapMult:1, moduleDropMult:0.1,
 };
 let inflationCount = 0;
 let shortCircuitJam = 0; // frames remaining on jam
@@ -11086,7 +11086,7 @@ function computeDiffMults(){
     diffMults.playerDmgPenalty  = d===0?1.0  :d===2?0.9  :1; // Assembly hurts player dmg
     diffMults.boostDrain        = d===0?0.9  :d===2?1.1  :1;
     diffMults.scrapMult         = hasMod2('depression')?0.5:1;
-    diffMults.moduleDropMult    = d===0?1.1  :d===2?0.9  :1;
+    diffMults.moduleDropMult    = d===0?0.2  :d===2?0.05  :0.1;
     inflationCount = 0;
     shortCircuitJam = 0;
 }
