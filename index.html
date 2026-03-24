@@ -137,7 +137,51 @@ let player = {
     legPhase:0, smoothMoveAngle:0,
     // Boost state
     boosting:false, boostRechargeDelay:0,
+    // Vector dash state
+    dashTimer:0, dashMaxSpeed:0,
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CHASSIS SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+const CHASSIS_LIST = ['VECTOR','ENGINEER','BASTION','SCAVENGER'];
+const CHASSIS_DEFS = {
+    VECTOR: {
+        name:'VECTOR', color:'#00ffcc',
+        active:'TRANSLATE',
+        activeDesc:'Momentum burst in your current facing direction.',
+        cooldown:300, // 5 seconds
+        flavorDesc:'Speed-focused chassis built for hit-and-run tactics.',
+    },
+    ENGINEER: {
+        name:'ENGINEER', color:'#ffaa00',
+        active:'BUILD DRONE',
+        activeDesc:'Spawn a combat drone. Drones shoot enemies and can be targeted.',
+        cooldown:1200, // 20 seconds (after drone dies or to fill slots)
+        maxDrones:1,
+        flavorDesc:'Support chassis that deploys autonomous combat drones.',
+    },
+    BASTION: {
+        name:'BASTION', color:'#4488ff',
+        active:'SHIELD BUBBLE',
+        activeDesc:'Become immune to all damage for 5 seconds.',
+        cooldown:3600, // 60 seconds
+        shieldDuration:300, // 5 seconds
+        flavorDesc:'Defensive chassis built to weather overwhelming fire.',
+    },
+    SCAVENGER: {
+        name:'SCAVENGER', color:'#ff4444',
+        active:'MONEY HURTS',
+        activeDesc:'Detonate a scrap explosion at your position, damaging nearby enemies.',
+        cooldown:300, // 5 seconds
+        flavorDesc:'Scrap-hungry chassis that turns currency into carnage.',
+    },
+};
+
+let selectedChassis   = 'VECTOR'; // persisted across runs
+let chassisCooldown   = 0;        // frames remaining on active ability cooldown
+let chassisShieldTimer= 0;        // BASTION: frames of shield remaining
+let engineerDrones    = [];       // ENGINEER: active drone objects
 let camera = {x:0, y:0};
 let keys={}, particles=[], frameTime=0;
 
@@ -155,6 +199,29 @@ let seenEnemyTypes   = new Set(); // enemy types encountered across all runs
 let visitedSectorIds = new Set(); // sector IDs visited across all runs
 let seenWeaponIds    = new Set(); // weapon IDs ever picked up/seen
 
+// ── Lifetime stats
+let lifetimeKills    = 0;   // total enemies killed across all runs
+let lifetimeScrap    = 0;   // total scrap collected across all runs
+let hasEverBeatenGame = false; // true once player completes a run (reaches lobby after boss)
+
+// Returns true if the given chassis is unlocked
+function isChassisUnlocked(id){
+    if(id === 'VECTOR')    return true; // always unlocked
+    if(id === 'ENGINEER')  return lifetimeKills >= 100;
+    if(id === 'BASTION')   return hasEverBeatenGame;
+    if(id === 'SCAVENGER') return lifetimeScrap >= 10000;
+    return false;
+}
+
+// Unlock requirement description string for display
+function chassisUnlockDesc(id){
+    if(id === 'VECTOR')    return 'DEFAULT — ALWAYS UNLOCKED';
+    if(id === 'ENGINEER')  return 'KILL 100 ENEMIES  ('+Math.min(lifetimeKills,100)+'/100)';
+    if(id === 'BASTION')   return 'BEAT THE GAME ONCE';
+    if(id === 'SCAVENGER') return 'COLLECT 10,000 SCRAP  ('+Math.min(lifetimeScrap,10000).toLocaleString()+'/10,000)';
+    return '';
+}
+
 // ── XP / LEVEL SYSTEM ─────────────────────────────────────────────────────────
 let playerXP    = 0;   // current XP this run
 let playerLevel = 1;   // current level this run (resets each run)
@@ -170,29 +237,160 @@ function triggerLevelUp(){
     playerXP -= xpForNextLevel();   // carry over excess
     playerLevel++;
 
-    // Hard Times Make Hard Bots: +10 maxHP per stack on level up
-    let hpGain = 0;
+    // Always: +10 maxHP on level up, full heal
+    let hpGain = 10;
+    // Hard Times Make Hard Bots: additional +10 per stack
     if(hasMeta('hard_times_hard_bots'))   hpGain += 10;
     if(hasMeta('hard_times_hard_bots_2')) hpGain += 10;
-    if(hpGain > 0){
-        player.maxHealth += hpGain;
-        player.health    += hpGain;
-    }
+    player.maxHealth += hpGain;
+    player.health = player.maxHealth; // full heal
 
     // Visual feedback
     spawnDamageText(player.x, player.y - 60, '\u2B06 LEVEL UP! ' + playerLevel, '#ffdd00');
-    for(let i = 0; i < 24; i++){
-        const a = Math.random()*Math.PI*2, sp = 2.5+Math.random()*5;
-        particles.push(new Particle(player.x,player.y,Math.cos(a)*sp,Math.sin(a)*sp,30+Math.random()*14,4+Math.random()*3,'surge'));
+    spawnDamageText(player.x, player.y - 82, '+'+hpGain+' MAX HP  \u2665 FULL HEAL', '#ff4466');
+    for(let i = 0; i < 32; i++){
+        const a = Math.random()*Math.PI*2, sp = 2.5+Math.random()*7;
+        particles.push(new Particle(player.x,player.y,Math.cos(a)*sp,Math.sin(a)*sp,30+Math.random()*18,4+Math.random()*4,'surge'));
     }
-    if(hpGain > 0){
-        spawnDamageText(player.x, player.y - 82, '+'+hpGain+' MAX HP', '#ff4466');
-    }
+
+    // Open the upgrade choice panel (pauses game input)
+    levelUpState.active   = true;
+    levelUpState.choices  = pickLevelUpChoices();
+    levelUpState.selected = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  META UPGRADE SYSTEM
+//  RUN UPGRADE SYSTEM  (per-run bonuses, chosen on level up, stackable)
 // ═══════════════════════════════════════════════════════════════════════════════
+const RUN_UPGRADE_DEFS = [
+    {
+        id:'speedy_recovery',
+        name:'SPEEDY RECOVERY',
+        color:'#00ffcc',
+        icon:'🗲',
+        desc:'Gives you more nanobots so you can recover from being tired faster.',
+        shortDesc:'-15% chassis CD',
+    },
+    {
+        id:'bomboclat_boom',
+        name:'BOMBOCLAT BOOM',
+        color:'#ff6600',
+        icon:'✷',
+        desc:'Put pimento and scotch bonnet peppers in your explosives to make it go BOMBOCLAT.',
+        shortDesc:'+10% explosion DMG & radius',
+    },
+    {
+        id:'stroking_technique',
+        name:'STROKING TECHNIQUE',
+        color:'#88ffaa',
+        icon:'⬇',
+        desc:'Practice a cetain act while looking at feet pics on Reddit. I didnt even know robots could do that.',
+        shortDesc:'-15% reload, +6% move speed',
+    },
+    {
+        id:'professional_fatass',
+        name:'PROFESSIONAL FATASS',
+        color:'#ff88cc',
+        icon:'⬤',
+        desc:'Eat. Eat. Eat. Eat until you are so fat your body evolves to absorb more fat from your food.',
+        shortDesc:'+15% all healing received',
+    },
+    {
+        id:'quick_fingers',
+        name:'QUICK FINGERS',
+        color:'#ffdd00',
+        icon:'»',
+        desc:'All that practice, fingering your makshift sex doll made of pats you found from your enemies at night.',
+        shortDesc:'+15% fire rate',
+    },
+    {
+        id:'dig_deeper',
+        name:'DIG DEEPER',
+        color:'#cc44ff',
+        icon:'▼',
+        desc:'"Don\' just put the tip in... Well? Is it in yet?"',
+        shortDesc:'+10% weakpoint damage',
+    },
+    {
+        id:'big_capacity',
+        name:'BIG CAPACITY',
+        color:'#44bbff',
+        icon:'⬆',
+        desc:'Jerk off so much times your balls grow to accomidate the sheer volume of "sauce" you are outputting.',
+        shortDesc:'+25% mag / +15% beam energy',
+    },
+];
+
+// Active run upgrades — array of id strings, duplicates allowed (stacking)
+let runUpgrades = [];
+
+// Level-up choice panel state
+let levelUpState = {
+    active: false,
+    choices: [],   // 3 RUN_UPGRADE_DEFS objects
+    selected: 0,   // 0-2 keyboard cursor
+};
+
+// ── Helper: count stacks of a run upgrade ─────────────────────────────────────
+function runUpgradeCount(id){ return runUpgrades.filter(x=>x===id).length; }
+
+// ── Helper: combined multipliers used throughout the game ─────────────────────
+function getRunUpgradeMult(id){ return Math.pow(1 + getRawRunBonus(id), runUpgradeCount(id)); }
+function getRawRunBonus(id){
+    switch(id){
+        case 'speedy_recovery':    return 0.15;
+        case 'bomboclat_boom':     return 0.10;
+        case 'stroking_technique': return -0.15; // reload
+        case 'professional_fatass':return 0.15;
+        case 'quick_fingers':      return 0.15;
+        case 'dig_deeper':         return 0.10;
+        case 'big_capacity':       return 0.25; // mag / 0.15 energy handled separately
+        default: return 0;
+    }
+}
+// Specific named getters used in the codebase
+function runUpgradeReloadMult(){  // < 1 = faster (shorter reload time)
+    const stacks = runUpgradeCount('stroking_technique');
+    return Math.pow(1 + 0.15, stacks);
+}
+function runUpgradeSpeedBonus(){  // additive fraction
+    return runUpgradeCount('stroking_technique') * 0.06;
+}
+function runUpgradeFireRateMult(){ // < 1 = faster cooldown
+    const stacks = runUpgradeCount('quick_fingers');
+    return Math.pow(1 - 0.15, stacks);
+}
+function runUpgradeExplosionMult(){ // > 1 = bigger
+    const stacks = runUpgradeCount('bomboclat_boom');
+    return Math.pow(1.10, stacks);
+}
+function runUpgradeHealMult(){ // > 1 = more healing
+    const stacks = runUpgradeCount('professional_fatass');
+    return Math.pow(1.15, stacks);
+}
+function runUpgradeCritMult(){ // additive bonus on top of base 2×
+    return runUpgradeCount('dig_deeper') * 0.10;
+}
+function runUpgradeMagMult(){ // > 1 = bigger mag
+    const stacks = runUpgradeCount('big_capacity');
+    return Math.pow(1.25, stacks);
+}
+function runUpgradeEnergyMult(){ // > 1 = more beam energy
+    const stacks = runUpgradeCount('big_capacity');
+    return Math.pow(1.15, stacks);
+}
+function runUpgradeChassisCDMult(){ // < 1 = shorter chassis CD
+    const stacks = runUpgradeCount('speedy_recovery');
+    return Math.pow(1 - 0.15, stacks);
+}
+
+// ── Pick 3 random upgrades for a level-up choice ─────────────────────────────
+function pickLevelUpChoices(){
+    const shuffled = [...RUN_UPGRADE_DEFS].sort(()=>Math.random()-0.5);
+    return shuffled.slice(0, 3);
+}
+
+//  META UPGRADE SYSTEM
 let metaUpgrades = new Set(); // PERMANENT — persists across runs
 
 const META_UPGRADE_DEFS = [
@@ -286,6 +484,10 @@ function saveGame(){
             seenEnemyTypes:  [...seenEnemyTypes],
             visitedSectorIds:[...visitedSectorIds],
             seenWeaponIds:   [...seenWeaponIds],
+            selectedChassis,
+            lifetimeKills,
+            lifetimeScrap,
+            hasEverBeatenGame,
         };
         localStorage.setItem(SAVE_KEY, JSON.stringify(data));
     } catch(e){ console.warn('[ALLDULE] Save failed:', e); }
@@ -301,6 +503,13 @@ function loadGame(){
         if(Array.isArray(data.seenEnemyTypes))   seenEnemyTypes   = new Set(data.seenEnemyTypes);
         if(Array.isArray(data.visitedSectorIds)) visitedSectorIds = new Set(data.visitedSectorIds);
         if(Array.isArray(data.seenWeaponIds))    seenWeaponIds    = new Set(data.seenWeaponIds);
+        if(typeof data.selectedChassis==='string' && CHASSIS_LIST.includes(data.selectedChassis))
+            selectedChassis = data.selectedChassis;
+        if(typeof data.lifetimeKills     === 'number') lifetimeKills      = data.lifetimeKills;
+        if(typeof data.lifetimeScrap     === 'number') lifetimeScrap      = data.lifetimeScrap;
+        if(typeof data.hasEverBeatenGame === 'boolean') hasEverBeatenGame = data.hasEverBeatenGame;
+        // If loaded chassis is now locked (e.g. save rollback), fall back to VECTOR
+        if(!isChassisUnlocked(selectedChassis)) selectedChassis = 'VECTOR';
     } catch(e){ console.warn('[ALLDULE] Load failed:', e); }
 }
 
@@ -498,6 +707,7 @@ function updateScrapPickups(){
                 scrapPickups.splice(i,1); continue;
             }
             playerScrap += s.amount;
+            lifetimeScrap += s.amount;
             spawnDamageText(s.x, s.y - 14, '+'+s.amount+' SCRAP', '#ffe566');
             scrapPickups.splice(i, 1);
         }
@@ -670,7 +880,7 @@ function attemptPurchase(vendor, itemIdx){
         const price = vendorBasePrice(type);
         if(playerScrap < price){ spawnDamageText(player.x,player.y-44,'NOT ENOUGH SCRAP!','#ff4444'); return; }
         playerScrap -= price;
-        const heal = Math.round(player.maxHealth * 0.5);
+        const heal = Math.round(player.maxHealth * 0.5 * runUpgradeHealMult());
         player.health = Math.min(player.maxHealth, player.health + heal);
         onDiffPurchase();
         spawnDamageText(player.x, player.y-52, '+'+heal+' HP HEALED!', '#44ff88');
@@ -912,7 +1122,7 @@ function updateEnemyHealOrbs(){
         orb.x += dx / d * 2.5;
         orb.y += dy / d * 2.5;
         if(d < 14 && orb.age > 10){
-            const heal = Math.ceil(player.maxHealth * 0.05);
+            const heal = Math.ceil(player.maxHealth * 0.05 * runUpgradeHealMult());
             player.health = Math.min(player.maxHealth, player.health + heal);
             spawnDamageText(player.x, player.y - 44, '+' + heal + ' HP', '#44ff88');
             for(let p = 0; p < 10; p++){
@@ -2222,6 +2432,8 @@ function recalcModMults(){
     playerArcMult       = Math.pow(1.4, cnt('wide_arc'));
     // Long Reach: melee range ×1.35 per stack
     playerRangeMult     = Math.pow(1.35, cnt('long_reach'));
+    // Quick Fingers: fire rate (cooldown drains faster)
+    playerCooldownDrain *= runUpgradeFireRateMult() < 1 ? (1 / runUpgradeFireRateMult()) : 1;
 }
 
 // ── Weapon runtime state ─────────────────────────────────────────────────────
@@ -2426,10 +2638,12 @@ class Enemy {
     takeDamage(dmg){
         if(this.dead) return;
         if(damageSourceIsPlayer) dmg = Math.round(dmg * playerDmgMult * 10) / 10;
-        this.hp-=dmg;
-        spawnDamageText(this.x,this.y-this.size-8,dmg|0,this.color);
-        camera.x+=(Math.random()-.5)*2; camera.y+=(Math.random()-.5)*2;
-        if(this.hp<=0) this.startDeath();
+        dmg = Math.max(dmg, 0);
+        if(!dmg) return; 
+        this.hp -= dmg;
+        spawnDamageText(this.x, this.y - this.size - 8, dmg|0, this.color);
+        camera.x += (Math.random()-.5)*2; camera.y += (Math.random()-.5)*2;
+        if(this.hp <= 0) this.startDeath();
     }
 
     startDeath(){
@@ -2468,6 +2682,7 @@ class Enemy {
         }
         // Drop scrap + grant XP
         if(damageSourceIsPlayer){
+            lifetimeKills++;
             const scrapAmt = calcScrapDrop(this.type);
             spawnScrapDrop(this.x, this.y, scrapAmt);
             const def = ENEMY_DEFS[this.type];
@@ -3382,6 +3597,8 @@ function drawPlayerDead(){
 
 function triggerRunComplete(){
     if(!runVan) return;
+    // ── Mark game as beaten (unlocks BASTION) ───────────────────────────────
+    if(!hasEverBeatenGame){ hasEverBeatenGame = true; saveGame(); }
     // ── Calculate blueprints ────────────────────────────────────────────────
     const sectorBP   = sectorsCleared + 1; // +1 for the boss sector itself
     const modifierBP = activeModifiers.size;
@@ -3436,6 +3653,271 @@ function resetRunState(){
     player.momentumX=0; player.momentumY=0;
     player.health=player.maxHealth; player.energy=player.maxEnergy;
     particles=[];
+    // Reset per-run upgrades
+    runUpgrades = [];
+    levelUpState = { active:false, choices:[], selected:0 };
+    // Reset chassis state
+    chassisCooldown    = 0;
+    chassisShieldTimer = 0;
+    engineerDrones     = [];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CHASSIS ACTIVE ABILITY  — called when player presses F
+// ═══════════════════════════════════════════════════════════════════════════════
+function activateChassisAbility(){
+    if(chassisCooldown > 0) return; // on cooldown
+    const def = CHASSIS_DEFS[selectedChassis];
+    const cdMult = runUpgradeChassisCDMult();
+
+    if(selectedChassis === 'VECTOR'){
+        // TRANSLATE — explosive burst in WASD direction, bypasses speed cap for a short window
+        const force = 38;
+        const dashSpeed = 38;
+        let dashDirX = 0, dashDirY = 0;
+        if(keys['w']||keys['ArrowUp'])    dashDirY -= 1;
+        if(keys['s']||keys['ArrowDown'])  dashDirY += 1;
+        if(keys['a']||keys['ArrowLeft'])  dashDirX -= 1;
+        if(keys['d']||keys['ArrowRight']) dashDirX += 1;
+        let dashAngle;
+        if(dashDirX !== 0 || dashDirY !== 0){
+            dashAngle = Math.atan2(dashDirY, dashDirX);
+        } else {
+            dashAngle = player.angle; // no input held — fall back to facing dir
+        }
+        // Set momentum directly so existing momentum doesn't fight the dash
+        player.momentumX = Math.cos(dashAngle) * force;
+        player.momentumY = Math.sin(dashAngle) * force;
+        // Unlock speed cap for 18 frames so the burst actually carries you
+        player.dashTimer    = 18;
+        player.dashMaxSpeed = dashSpeed;
+        // Particle burst
+        for(let i=0;i<28;i++){
+            const a = dashAngle + (Math.random()-0.5)*0.9;
+            const sp = 6+Math.random()*14;
+            particles.push(new Particle(player.x,player.y,Math.cos(a)*sp,Math.sin(a)*sp,14+Math.random()*10,4+Math.random()*3,'surge'));
+        }
+        spawnDamageText(player.x, player.y-40, 'TRANSLATE!', def.color);
+        chassisCooldown = Math.round(def.cooldown * cdMult);
+
+    } else if(selectedChassis === 'ENGINEER'){
+        // BUILD DRONE — spawn if slot available
+        const maxD = def.maxDrones + (engineerDroneSlotsBonus||0);
+        const alive = engineerDrones.filter(d=>!d.dead).length;
+        if(alive >= maxD){ spawnDamageText(player.x,player.y-40,'DRONE SLOTS FULL!',def.color); return; }
+        const angle = Math.random()*Math.PI*2;
+        engineerDrones.push({
+            x: player.x + Math.cos(angle)*36,
+            y: player.y + Math.sin(angle)*36,
+            vx:0, vy:0,
+            hp:30, maxHp:30,
+            dead:false, age:0,
+            shootTimer:0, shootCooldown:60,
+            orbitAngle: angle,
+            deathTimer:20,
+        });
+        spawnDamageText(player.x, player.y-40, 'DRONE DEPLOYED!', def.color);
+        for(let i=0;i<12;i++){
+            const a=Math.random()*Math.PI*2, sp=1.5+Math.random()*4;
+            particles.push(new Particle(player.x,player.y,Math.cos(a)*sp,Math.sin(a)*sp,12,3,'surge'));
+        }
+        chassisCooldown = Math.round(def.cooldown * cdMult);
+
+    } else if(selectedChassis === 'BASTION'){
+        // SHIELD BUBBLE — activate invincibility
+        chassisShieldTimer = def.shieldDuration;
+        for(let i=0;i<24;i++){
+            const a=Math.random()*Math.PI*2, sp=1+Math.random()*4;
+            particles.push(new Particle(player.x,player.y,Math.cos(a)*sp,Math.sin(a)*sp,20+Math.random()*10,5+Math.random()*2,'surge'));
+        }
+        spawnDamageText(player.x, player.y-40, 'SHIELD BUBBLE!', def.color);
+        chassisCooldown = Math.round(def.cooldown * cdMult);
+
+    } else if(selectedChassis === 'SCAVENGER'){
+        // MONEY HURTS — scrap explosion, scaled by bomboclat_boom
+        const boomMult = runUpgradeExplosionMult();
+        const baseDmg = (60 + Math.floor(playerScrap * 0.1)) * boomMult;
+        const blastR  = 160 * boomMult;
+        // Damage enemies
+        damageSourceIsPlayer = true;
+        for(const e of enemies){
+            if(e.dead) continue;
+            const d = Math.hypot(e.x-player.x, e.y-player.y);
+            if(d < blastR){
+                const falloff = 1 - d/blastR;
+                e.takeDamage(Math.round(baseDmg * falloff));
+            }
+        }
+        if(activeBoss && !activeBoss.dead){
+            const d = Math.hypot(activeBoss.x-player.x, activeBoss.y-player.y);
+            if(d < blastR) activeBoss.takeDamage(Math.round(baseDmg*(1-d/blastR)), player.x, player.y);
+        }
+        // Burst of scrap pickups
+        const scrapCount = 5 + Math.floor(Math.random()*4);
+        for(let i=0;i<scrapCount;i++) spawnScrapDrop(player.x,player.y, 2+Math.floor(Math.random()*5));
+        // Visual
+        for(let i=0;i<32;i++){
+            const a=Math.random()*Math.PI*2, sp=3+Math.random()*14;
+            particles.push(new Particle(player.x,player.y,Math.cos(a)*sp,Math.sin(a)*sp,22+Math.random()*14,5+Math.random()*3,'surge'));
+        }
+        camera.x+=(Math.random()-.5)*14; camera.y+=(Math.random()-.5)*14;
+        spawnDamageText(player.x, player.y-40, 'MONEY HURTS! −'+Math.round(baseDmg), def.color);
+        chassisCooldown = Math.round(def.cooldown * cdMult);
+    }
+}
+
+let engineerDroneSlotsBonus = 0; // could be upgraded later
+
+// ── Big Capacity: scale a weapon's maxAmmo by the current run upgrade mult ───
+// Called when the upgrade is picked AND at run start (via recalcRunUpgradeAmmo)
+function applyBigCapacityToWeapon(weaponIdx){
+    const wp = WEAPONS[weaponIdx];
+    if(wp.maxAmmo === undefined) return; // melee / no ammo
+    // Store the pristine base maxAmmo on first call
+    if(wp._baseMaxAmmo === undefined) wp._baseMaxAmmo = wp.maxAmmo;
+    const mult = runUpgradeMagMult();
+    wp.maxAmmo = Math.max(1, Math.round(wp._baseMaxAmmo * mult));
+    // If already reloaded (full), bump current ammo too
+    if(wp.ammo >= wp._baseMaxAmmo) wp.ammo = wp.maxAmmo;
+    // Also scale beam-type energy (Big Capacity energy bonus tracked via maxEnergy separately)
+}
+
+// Re-applies Big Capacity to the active weapon slot after picking the upgrade
+function recalcRunUpgradeAmmo(){
+    for(let s=0;s<2;s++){
+        if(moduleSlots[s]!==-1) applyBigCapacityToWeapon(moduleSlots[s]);
+    }
+}
+
+// ── Update engineer drones each game frame ────────────────────────────────────
+function updateEngineerDrones(){
+    for(let i = engineerDrones.length-1; i >= 0; i--){
+        const d = engineerDrones[i];
+        if(d.dead){
+            d.deathTimer--;
+            if(d.deathTimer<=0) engineerDrones.splice(i,1);
+            continue;
+        }
+        d.age++;
+        // Orbit loosely around player
+        d.orbitAngle += 0.022;
+        const targetDist = 55;
+        const tx = player.x + Math.cos(d.orbitAngle) * targetDist;
+        const ty = player.y + Math.sin(d.orbitAngle) * targetDist;
+        d.vx += (tx - d.x) * 0.06;
+        d.vy += (ty - d.y) * 0.06;
+        d.vx *= 0.82; d.vy *= 0.82;
+
+        // Wall collision — slide along walls (prevents drone from clipping inside geometry)
+        const _dr = 8;
+        function _droneCheckCol(cx, cy){
+            for(const p of [{x:cx-_dr,y:cy-_dr},{x:cx+_dr,y:cy-_dr},{x:cx-_dr,y:cy+_dr},{x:cx+_dr,y:cy+_dr}]){
+                const t = map[Math.floor(p.y/TILE_SIZE)]?.[Math.floor(p.x/TILE_SIZE)];
+                if(t===T_WALL||t===T_VOID) return true;
+            }
+            return false;
+        }
+        if(!_droneCheckCol(d.x + d.vx, d.y)) d.x += d.vx; else d.vx = 0;
+        if(!_droneCheckCol(d.x, d.y + d.vy)) d.y += d.vy; else d.vy = 0;
+
+        // Find nearest enemy to shoot at
+        d.shootTimer++;
+        if(d.shootTimer >= d.shootCooldown){
+            let target = null, bestDist = 400;
+            for(const e of enemies){
+                if(e.dead) continue;
+                const ed = Math.hypot(e.x-d.x, e.y-d.y);
+                if(ed < bestDist){ bestDist=ed; target=e; }
+            }
+            if(!target && activeBoss && !activeBoss.dead){
+                const bd = Math.hypot(activeBoss.x-d.x, activeBoss.y-d.y);
+                if(bd < bestDist){ bestDist=bd; target=activeBoss; }
+            }
+            if(target){
+                d.shootTimer = 0;
+                const angle = Math.atan2(target.y-d.y, target.x-d.x);
+                const speed = 8;
+                const proj = new Projectile(d.x, d.y, Math.cos(angle)*speed, Math.sin(angle)*speed, 'pulse_s', WEAPONS[currentWeapon]);
+                proj._fromDrone = true;
+                projectiles.push(proj);
+                // Particle muzzle flash
+                for(let k=0;k<5;k++){
+                    const a=angle+(Math.random()-0.5)*0.5, sp=2+Math.random()*4;
+                    particles.push(new Particle(d.x,d.y,Math.cos(a)*sp,Math.sin(a)*sp,8,2,'spark'));
+                }
+            }
+        }
+
+        // Enemy/boss projectiles can also damage drones
+        for(let j=enemyProjectiles.length-1; j>=0; j--){
+            const ep = enemyProjectiles[j];
+            if(!ep.alive) continue;
+            if(Math.hypot(ep.x-d.x, ep.y-d.y) < ep.radius+8){
+                d.hp -= ep.dmg;
+                ep.alive = false;
+                if(d.hp <= 0){
+                    d.dead = true;
+                    d.deathTimer = 20;
+                    for(let k=0;k<14;k++){
+                        const a=Math.random()*Math.PI*2, sp=2+Math.random()*6;
+                        particles.push(new Particle(d.x,d.y,Math.cos(a)*sp,Math.sin(a)*sp,16,4,'surge'));
+                    }
+                    spawnDamageText(d.x,d.y-20,'DRONE DESTROYED!',CHASSIS_DEFS.ENGINEER.color);
+                    // Reset cooldown so player can redeploy
+                    chassisCooldown = Math.min(chassisCooldown, Math.round(CHASSIS_DEFS.ENGINEER.cooldown * runUpgradeChassisCDMult()));
+                }
+                break;
+            }
+        }
+    }
+}
+
+// ── Draw engineer drones ──────────────────────────────────────────────────────
+function drawEngineerDrones(){
+    for(const d of engineerDrones){
+        const col = CHASSIS_DEFS.ENGINEER.color;
+        const t2 = Date.now()/1000;
+        const alpha = d.dead ? Math.max(0, d.deathTimer/20) : 1;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(d.x, d.y);
+
+        // Glow
+        const pulse = Math.sin(t2*6+d.age*0.05)*0.35+0.65;
+        ctx.shadowBlur = 10+pulse*8; ctx.shadowColor = col;
+
+        // Body hexagon
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for(let i=0;i<6;i++){
+            const a=i/6*Math.PI*2;
+            if(i===0) ctx.moveTo(Math.cos(a)*9, Math.sin(a)*9);
+            else       ctx.lineTo(Math.cos(a)*9, Math.sin(a)*9);
+        }
+        ctx.closePath(); ctx.stroke();
+
+        // Rotor arms
+        ctx.strokeStyle = col+'aa'; ctx.lineWidth=1;
+        for(let i=0;i<4;i++){
+            const a = i/4*Math.PI*2 + t2*10;
+            ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(Math.cos(a)*6, Math.sin(a)*6); ctx.stroke();
+        }
+
+        // Core
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(0,0,3,0,Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // HP bar
+        if(!d.dead && d.hp < d.maxHp){
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillRect(-10,-16,20,3);
+            ctx.fillStyle = d.hp/d.maxHp > 0.5 ? '#44ff88' : '#ff4444';
+            ctx.fillRect(-10,-16, 20*(d.hp/d.maxHp), 3);
+        }
+
+        ctx.restore();
+    }
 }
 
 // ── Boss door seal/unseal ──────────────────────────────────────────────────────
@@ -4429,7 +4911,7 @@ function thrustCheckEnemies(ox, oy, angle, reach, dmg, hitboxR){
         const cx = ox + dx*t, cy = oy + dy*t;
         if(Math.hypot(e.x-cx, e.y-cy) < e.size + hitboxR){
             const wpHit = rayHitsWeakpoint(e, ox, oy, angle, reach);
-            e.takeDamage(wpHit ? dmg*2 : dmg);
+            e.takeDamage(wpHit ? dmg*(2 + runUpgradeCritMult()) : dmg);
             if(wpHit) triggerWeakpointEffect(e);
             wState.thrustHitSet.add(e);
         }
@@ -4534,7 +5016,7 @@ function checkProjectileEnemyHits(proj){
                 proj.prevX!==undefined?proj.prevX:proj.x,
                 proj.prevY!==undefined?proj.prevY:proj.y,
                 Math.atan2(proj.vy,proj.vx), Math.hypot(proj.vx,proj.vy)*2+e.size*2);
-            if(wpHit){ dmg*=2; triggerWeakpointEffect(e);
+            if(wpHit){ dmg*=(2 + runUpgradeCritMult()); triggerWeakpointEffect(e);
                 if(proj.kind==='pulse'){
                     const wp=WEAPONS[currentWeapon];
                     wp.ammo=Math.min(wp.maxAmmo,wp.ammo+1);
@@ -4599,6 +5081,7 @@ function updateEnemies(){
     for(const e of enemies){
         e.age++;
         if(e.dead){ e.deathTimer--; continue; }
+        if(e.hp <= 0){ e.startDeath(); continue; }
         if(e.atkTimer>0) e.atkTimer--;
 
         // Apply knockback velocity (from weapons like Titan Greatsword, Impact Pike)
@@ -6116,6 +6599,40 @@ ctx.shadowBlur = 0;
 
 window.addEventListener('keydown', e => {
     if(gameState!=='playing') return;
+
+    // ── Level-up panel: absorb all input while active ────────────────────────
+    if(levelUpState.active){
+        if(e.key==='ArrowLeft' ||e.key==='a'||e.key==='A'){
+            levelUpState.selected=(levelUpState.selected-1+3)%3;
+        } else if(e.key==='ArrowRight'||e.key==='d'||e.key==='D'){
+            levelUpState.selected=(levelUpState.selected+1)%3;
+        } else if(e.key==='Enter'||e.key==='e'||e.key==='E'||e.key===' '){
+            e.preventDefault();
+            const chosen = levelUpState.choices[levelUpState.selected];
+            if(chosen){
+                runUpgrades.push(chosen.id);
+                // Big Capacity: scale magazine on both equipped slots + bump beam energy
+                if(chosen.id==='big_capacity'){
+                    recalcRunUpgradeAmmo();
+                    // Increase beam/track-laser energy cap
+                    player.maxEnergy = Math.round(player.maxEnergy * 1.15);
+                    player.energy    = Math.min(player.energy * 1.15, player.maxEnergy);
+                }
+                // Stroking Technique: immediately update speed
+                if(chosen.id==='stroking_technique'){
+                    recalcModMults();
+                    // re-run difficulty so player.speed picks up the new bonus
+                    const prevH = player.health, prevMH = player.maxHealth;
+                    applyDifficultyToRun();
+                    player.maxHealth = prevMH; player.health = prevH; // preserve HP
+                }
+                spawnDamageText(player.x, player.y-50, chosen.name+'!', chosen.color);
+            }
+            levelUpState.active = false;
+        }
+        return; // swallow all keys while panel open
+    }
+
     keys[e.key]=true;
     // Prevent space from scrolling the page
     if(e.key===' ') e.preventDefault();
@@ -6160,6 +6677,8 @@ window.addEventListener('keydown', e => {
         }
     }
     if(e.key==='r'||e.key==='R') startReload();
+    // F: chassis active ability
+    if(e.key==='f'||e.key==='F') activateChassisAbility();
 });
 window.addEventListener('keyup',   e => { if(gameState==='playing') keys[e.key]=false; });
 window.addEventListener('mousemove', e => {
@@ -6478,7 +6997,8 @@ class Projectile {
     if(this.x<0||this.x>MAP_W*TILE_SIZE||this.y<0||this.y>MAP_H*TILE_SIZE) this.alive=false;
 }
     explode(){
-        const rad=this.wd.explosionRadius||70, bf=this.wd.blastForce||4;
+        const boomMult = runUpgradeExplosionMult();
+        const rad=(this.wd.explosionRadius||70)*boomMult, bf=this.wd.blastForce||4;
         for(let i=0;i<22;i++){
             const a=Math.random()*Math.PI*2, sp=1.5+Math.random()*6;
             particles.push(new Particle(this.x,this.y,Math.cos(a)*sp,Math.sin(a)*sp,22+Math.random()*18,5+Math.random()*4,'spark'));
@@ -6493,7 +7013,7 @@ class Projectile {
             player.momentumX+=Math.cos(ang)*force; player.momentumY+=Math.sin(ang)*force;
         }
         // Blast damage enemies
-        const explodeDmg = this.wd.damage??20;
+        const explodeDmg = (this.wd.damage??20) * boomMult;
         for(const e of enemies){
             if(e.dead) continue;
             const ed=Math.hypot(e.x-this.x,e.y-this.y);
@@ -6690,7 +7210,8 @@ class MortarShell {
     _explode(){
         if(this.exploded) return;
         this.exploded=true;
-        const rad=this.wd.explosionRadius||92, bf=this.wd.blastForce||8;
+        const boomMult = runUpgradeExplosionMult();
+        const rad=(this.wd.explosionRadius||92)*boomMult, bf=this.wd.blastForce||8;
         const col=this.wd.color||'#ff4400';
 
         // Big particle burst
@@ -6707,7 +7228,7 @@ class MortarShell {
             const d=Math.hypot(e.x-this.tx,e.y-this.ty);
             if(d<rad){
                 const frac=1-d/rad;
-                const dmg=Math.round(80*frac);
+                const dmg=Math.round(80*boomMult*frac);
                 e.takeDamage(dmg);
                 // Heavy knockback
                 const ang=Math.atan2(e.y-this.ty,e.x-this.tx);
@@ -6715,7 +7236,7 @@ class MortarShell {
                 e.vy+=Math.sin(ang)*bf*frac*1.6;
             }
         }
-        if(activeBoss&&!activeBoss.dead){ const bd=Math.hypot(activeBoss.x-this.tx,activeBoss.y-this.ty); if(bd<rad) activeBoss.takeDamage(Math.round(80*(1-bd/rad)),this.tx,this.ty); }
+        if(activeBoss&&!activeBoss.dead){ const bd=Math.hypot(activeBoss.x-this.tx,activeBoss.y-this.ty); if(bd<rad) activeBoss.takeDamage(Math.round(80*boomMult*(1-bd/rad)),this.tx,this.ty); }
         // Blast push player
         const pd=Math.hypot(player.x-this.tx,player.y-this.ty);
         if(pd<rad){
@@ -6899,7 +7420,8 @@ function startReload(){
     if(wState.reloading) return;
     if(wp.type==='beam'||wp.type==='precise_track') return; // auto-recharge types
     wState.reloading=true;
-    wState.reloadDuration=wp.reloadTime||75;
+    // Stroking Technique: shorter reload duration
+    wState.reloadDuration=Math.max(10, Math.round((wp.reloadTime||75) * runUpgradeReloadMult()));
     wState.reloadTimer=wState.reloadDuration;
     wState.holdingFire=false;
     spawnDamageText(player.x,player.y-38,'RELOADING…',wp.color);
@@ -6999,6 +7521,8 @@ function spawnDamageText(x,y,text,color){
 
 // Centralised enemy → player damage; applies current depth damage scale
 function hurtPlayer(dmg){
+    // BASTION: shield bubble blocks all damage
+    if(chassisShieldTimer > 0) return 0;
     let mult = enemyScaleDmg * diffMults.enemyDmg * activeEnemyDmgMult;
     if(hasMod2('corroded_plating')) mult *= 1.2;
     if(hasMod2('small_pockets')) mult *= 1 + Math.min(playerScrap/500, 1)*0.5;
@@ -7495,7 +8019,7 @@ function firePreciseRail(wp){ // ── Prism Rail
             if(Math.hypot(e.x-cx3,e.y-cy3)<e.size+10){
                 const wpHit=segmentHitsWeakpoint(e,seg.x1,seg.y1,seg.x2,seg.y2);
                 let finalDmg=baseDmg;
-                if(wpHit) finalDmg*=2;
+                if(wpHit) finalDmg*=2 + runUpgradeCritMult;
                 e.takeDamage(finalDmg);
                 if(wpHit) triggerWeakpointEffect(e);
             }
@@ -7888,7 +8412,7 @@ function updateWeapons(){
                         // Ray-trace the beam segment through the weakpoint
                         const wpHit=rayHitsWeakpoint(e,player.x,player.y,player.angle,wp.beamLength);
                         e.takeDamage(wpHit?6:3);
-                        if(wpHit&&Math.random()<0.06) triggerWeakpointEffect(e); // throttled so it doesn't spam every frame
+                        if(wpHit) triggerWeakpointEffect(e);
                     }
                 }
                 if(activeBoss&&!activeBoss.dead){
@@ -8007,7 +8531,7 @@ function updateWeapons(){
                     spawnDamageText(closestX,closestY-20+(Math.random()-.5)*8,'▲ WP x'+wState.needleStack,sc);
                     triggerWeakpointEffect(e);
                 }
-                const needleDmg=wpHit?(15+wState.needleStack*5)*2:15;
+                const needleDmg=wpHit?(15+wState.needleStack*5)*2 + runUpgradeCritMult:15;
                 e.takeDamage(needleDmg);
                 // Spark burst on impact at closest point
                 for(let p=0;p<5;p++){
@@ -8094,7 +8618,7 @@ function updateWeapons(){
                     if(Math.random()<0.5){
                         const wpHit=rayHitsWeakpoint(e,player.x,player.y,player.angle,wp.beamLength);
                         if(wpHit){
-                            e.takeDamage(trackDmg*2);
+                            e.takeDamage(trackDmg*2 + runUpgradeCritMult);
                             triggerWeakpointEffect(e);
                         } else {
                             e.takeDamage(trackDmg);
@@ -8769,6 +9293,8 @@ function generateWalls(){
 function update(){
     frameTime++;
     if(trans.active){ updateTransition(); return; }
+    // Level-up panel freezes the game world
+    if(levelUpState.active) return;
 
     // ── Inactive-slot ammo reset (4 s = 240 frames) ──────────────────────────
     // The active slot's counter is always zeroed; the inactive slot counts up.
@@ -8837,8 +9363,11 @@ function update(){
         }
     }
 
-    // Speed cap — higher when boosting, normal otherwise
-    const activeMaxSpeed = player.boosting ? BOOST_MAX_SPEED : player.maxSpeed;
+    // Speed cap — higher when boosting or dashing, normal otherwise
+    if(player.dashTimer > 0) player.dashTimer--;
+    const activeMaxSpeed = player.dashTimer > 0 ? player.dashMaxSpeed
+                         : player.boosting      ? BOOST_MAX_SPEED
+                         :                        player.maxSpeed;
 
     player.momentumX*=player.friction; player.momentumY*=player.friction;
     const spd=Math.hypot(player.momentumX,player.momentumY);
@@ -8869,6 +9398,20 @@ function update(){
 
     updateWeapons();
     updateEnemies();
+
+    // ── Chassis systems ──────────────────────────────────────────────────────
+    if(chassisCooldown > 0) chassisCooldown--;
+    if(chassisShieldTimer > 0){
+        chassisShieldTimer--;
+        // Shield pulse particles
+        if(chassisShieldTimer % 8 === 0){
+            for(let i=0;i<3;i++){
+                const a=Math.random()*Math.PI*2;
+                particles.push(new Particle(player.x,player.y,Math.cos(a)*1.5,Math.sin(a)*1.5,14,3,'surge'));
+            }
+        }
+    }
+    if(selectedChassis==='ENGINEER') updateEngineerDrones();
 
     // ── Scrap pickups ────────────────────────────────────────────────────────
     updateScrapPickups();
@@ -9754,7 +10297,25 @@ function draw(){
     if(activeBoss) drawBossEntity(activeBoss);
     drawRunVan();
     drawWeaponEffects();
+    if(selectedChassis==='ENGINEER') drawEngineerDrones();
     drawPlayer();
+    // BASTION: draw shield bubble around player
+    if(chassisShieldTimer > 0){
+        const st = Date.now()/1000;
+        const sFrac = chassisShieldTimer / CHASSIS_DEFS.BASTION.shieldDuration;
+        const sPulse = Math.sin(st * 10) * 0.3 + 0.7;
+        const sCol = CHASSIS_DEFS.BASTION.color;
+        ctx.save();
+        ctx.translate(player.x, player.y);
+        ctx.globalAlpha = 0.35 + sPulse * 0.25;
+        ctx.shadowBlur = 28 + sPulse * 14; ctx.shadowColor = sCol;
+        ctx.strokeStyle = sCol; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(0, 0, player.size + 14 + sPulse*4, 0, Math.PI*2); ctx.stroke();
+        ctx.fillStyle = sCol + '22';
+        ctx.beginPath(); ctx.arc(0, 0, player.size + 14 + sPulse*4, 0, Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+        ctx.restore();
+    }
     drawScrapPickups();
     drawEnemyHealOrbs();
     drawVendors();
@@ -9762,7 +10323,169 @@ function draw(){
     drawDamageTexts();
     drawHUD(); drawCompass(); drawMinimap(); drawBossHUD();
     drawShopUI();
+    if(levelUpState.active) drawLevelUpPanel();
     drawTransition();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LEVEL-UP CHOICE PANEL
+// ═══════════════════════════════════════════════════════════════════════════════
+function drawLevelUpPanel(){
+    const W = canvas.width, H = canvas.height;
+    const cx = W/2, cy = H/2;
+    const t = Date.now()/1000;
+
+    // Dimmed game backdrop
+    ctx.fillStyle = 'rgba(0,4,18,0.82)';
+    ctx.fillRect(0,0,W,H);
+
+    // Outer panel
+    const PW = 700, PH = 420;
+    const px = cx - PW/2, py = cy - PH/2;
+    const panG = ctx.createLinearGradient(px,py,px,py+PH);
+    panG.addColorStop(0,'rgba(2,10,30,0.99)');
+    panG.addColorStop(1,'rgba(0,4,18,0.99)');
+    ctx.fillStyle = panG;
+    ctx.strokeStyle = 'rgba(255,220,60,0.55)';
+    ctx.lineWidth = 2;
+    ctx.shadowBlur = 32; ctx.shadowColor = 'rgba(255,200,40,0.35)';
+    roundRect(px,py,PW,PH,10); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+
+    // Header stripe
+    ctx.fillStyle = 'rgba(255,200,40,0.10)';
+    roundRect(px,py,PW,52,10); ctx.fill();
+
+    // Header text
+    ctx.fillStyle = '#ffdd00'; ctx.font = 'bold 18px Orbitron';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowBlur = 18; ctx.shadowColor = '#ffaa00';
+    ctx.fillText('\u2B06 LEVEL UP!  LVL '+playerLevel, cx, py+20); ctx.shadowBlur = 0;
+
+    ctx.fillStyle = 'rgba(200,180,100,0.55)'; ctx.font = 'bold 9px Orbitron';
+    ctx.fillText('CHOOSE AN UPGRADE •  [◄/►] BROWSE  •  [E] CONFIRM', cx, py+40);
+
+    // Divider
+    ctx.strokeStyle = 'rgba(255,200,40,0.25)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px+20,py+52); ctx.lineTo(px+PW-20,py+52); ctx.stroke();
+
+    // Cards
+    const CARD_W = 195, CARD_H = 310, CARD_GAP = 22;
+    const totalW = 3 * CARD_W + 2 * CARD_GAP;
+    const startX = cx - totalW/2;
+    const cardY  = py + 68;
+
+    levelUpState.choices.forEach((upg, ci) => {
+        const col    = upg.color;
+        const isSel  = ci === levelUpState.selected;
+        const pulse  = Math.sin(t * 3 + ci * 1.1) * 0.4 + 0.6;
+        const cardX  = startX + ci * (CARD_W + CARD_GAP);
+        const stacks = runUpgradeCount(upg.id); // how many times already owned
+
+        // Card background
+        ctx.fillStyle = isSel ? col+'28' : 'rgba(6,12,28,0.92)';
+        ctx.strokeStyle = isSel ? col : col+'55';
+        ctx.lineWidth = isSel ? 2.5 : 1.2;
+        ctx.shadowBlur = isSel ? 22+pulse*10 : 5;
+        ctx.shadowColor = col;
+        roundRect(cardX, cardY, CARD_W, CARD_H, 8); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+
+        // Top accent bar
+        ctx.fillStyle = col + (isSel ? 'cc' : '55');
+        roundRect(cardX, cardY, CARD_W, 6, 8); ctx.fill();
+
+        // Big icon
+        ctx.font = '36px Orbitron';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = col;
+        ctx.shadowBlur = isSel ? 16+pulse*10 : 6; ctx.shadowColor = col;
+        ctx.fillText(upg.icon, cardX+CARD_W/2, cardY+48); ctx.shadowBlur = 0;
+
+        // Name
+        ctx.fillStyle = isSel ? '#ffffff' : col;
+        ctx.font = 'bold 12px Orbitron';
+        ctx.shadowBlur = isSel ? 10 : 3; ctx.shadowColor = col;
+        // Word-wrap name if long
+        const nameParts = upg.name.split(' ');
+        let nameLine1 = '', nameLine2 = '';
+        for(const w of nameParts){
+            if((nameLine1+w).length < 14) nameLine1 += w+' ';
+            else nameLine2 += w+' ';
+        }
+        ctx.fillText(nameLine1.trim(), cardX+CARD_W/2, cardY+84);
+        if(nameLine2.trim()) ctx.fillText(nameLine2.trim(), cardX+CARD_W/2, cardY+98);
+        ctx.shadowBlur = 0;
+
+        // Short desc
+        ctx.fillStyle = isSel ? 'rgba(220,230,255,0.85)' : 'rgba(140,155,180,0.6)';
+        ctx.font = 'bold 10px Orbitron';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        // Wrap at ~24 chars
+        const words = upg.desc.split(' ');
+        let line='', lines=[];
+        for(const w of words){
+            if((line+w).length > 24){ lines.push(line.trim()); line=''; }
+            line += w+' ';
+        }
+        if(line.trim()) lines.push(line.trim());
+        lines.slice(0,5).forEach((l,li)=>{
+            ctx.fillText(l, cardX+10, cardY+114+li*12);
+        });
+
+        // Stack counter badge
+        if(stacks > 0){
+            const badgeY = cardY + 260;
+            ctx.fillStyle = col+'44';
+            ctx.strokeStyle = col+'99'; ctx.lineWidth = 1;
+            roundRect(cardX+CARD_W/2-30, badgeY, 60, 18, 4); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = col; ctx.font = 'bold 8px Orbitron';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.shadowBlur = 6; ctx.shadowColor = col;
+            ctx.fillText('STACK ×'+stacks, cardX+CARD_W/2, badgeY+9); ctx.shadowBlur=0;
+        }
+
+        // Per-stack bonus line
+        const bonusPct = Math.round(getRawRunBonus(upg.id)*100);
+        ctx.fillStyle = isSel ? col : col+'88';
+        ctx.font = 'bold 8px Orbitron';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(upg.shortDesc, cardX+CARD_W/2, cardY+284);
+
+        // Selected highlight glow border pulsing corners
+        if(isSel){
+            ctx.strokeStyle = col;
+            ctx.lineWidth = 1.5;
+            const corners = [[cardX,cardY],[cardX+CARD_W,cardY],[cardX,cardY+CARD_H],[cardX+CARD_W,cardY+CARD_H]];
+            const signs   = [[1,1],[-1,1],[1,-1],[-1,-1]];
+            corners.forEach(([cx2,cy2],i)=>{
+                const [sx,sy]=signs[i];
+                ctx.beginPath();
+                ctx.moveTo(cx2+sx*12,cy2); ctx.lineTo(cx2,cy2); ctx.lineTo(cx2,cy2+sy*12);
+                ctx.stroke();
+            });
+            // Confirm prompt
+            const blink = Math.floor(t*2.5)%2===0;
+            ctx.fillStyle = blink ? '#ffffff' : col;
+            ctx.font = 'bold 9px Orbitron'; ctx.textBaseline = 'middle';
+            ctx.shadowBlur = 8; ctx.shadowColor = col;
+            ctx.fillText('[E] TAKE IT', cardX+CARD_W/2, cardY+CARD_H+14);
+            ctx.shadowBlur = 0;
+        }
+    });
+
+    // Current run upgrades summary strip at bottom
+    if(runUpgrades.length > 0){
+        ctx.fillStyle = 'rgba(140,160,200,0.35)'; ctx.font = 'bold 7px Orbitron';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        const summary = 'CURRENT UPGRADES: ' + [...new Set(runUpgrades)].map(id=>{
+            const def2 = RUN_UPGRADE_DEFS.find(d=>d.id===id);
+            const cnt = runUpgrades.filter(x=>x===id).length;
+            return (def2?def2.name:'?') + (cnt>1?' ×'+cnt:'');
+        }).join('  •  ');
+        ctx.fillText(summary, cx, py+PH-10);
+    }
+
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -9855,8 +10578,50 @@ function drawHUD(){
         ctx.fillText('[SPACE] BOOST', ebX+ebW-6, ebY+ebH/2);
     }
 
+    // ── Chassis ability bar ──────────────────────────────────────────────────
+    const caY = ebY + ebH + 6;
+    const cbW = 220, cbH = 13, cbsl = 6;
+    {
+        const chDef2 = CHASSIS_DEFS[selectedChassis];
+        const chCol2 = chDef2.color;
+        const shielding = chassisShieldTimer > 0;
+        const cdFrac = chassisCooldown > 0 ? 1 - chassisCooldown / chDef2.cooldown : 1;
+        const shieldFrac = shielding ? chassisShieldTimer / CHASSIS_DEFS.BASTION.shieldDuration : 0;
+
+        ctx.fillStyle = 'rgba(0,7,16,0.88)';
+        slantedRect(pad, caY, cbW, cbH, cbsl); ctx.fill();
+
+        if(shielding){
+            const sp2 = Math.sin(Date.now() / 80) * 0.25 + 0.75;
+            ctx.fillStyle = chCol2; ctx.shadowBlur = 12 * sp2; ctx.shadowColor = chCol2;
+            slantedRect(pad, caY, cbW * shieldFrac, cbH, cbsl); ctx.fill(); ctx.shadowBlur = 0;
+        } else {
+            ctx.fillStyle = cdFrac >= 1 ? chCol2 : chCol2 + '66';
+            ctx.shadowBlur = cdFrac >= 1 ? 10 : 4; ctx.shadowColor = chCol2;
+            slantedRect(pad, caY, cbW * cdFrac, cbH, cbsl); ctx.fill(); ctx.shadowBlur = 0;
+        }
+        ctx.strokeStyle = chCol2 + '88'; ctx.lineWidth = 1.5;
+        slantedRect(pad, caY, cbW, cbH, cbsl); ctx.stroke();
+
+        ctx.fillStyle = chCol2; ctx.font = 'bold 8px Orbitron';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText('[F] ' + chDef2.active, pad + 6, caY + cbH / 2);
+
+        ctx.font = 'bold 7px Orbitron'; ctx.textAlign = 'right';
+        if(shielding){
+            ctx.fillStyle = chCol2;
+            ctx.fillText('SHIELDED ' + (chassisShieldTimer / 60).toFixed(1) + 's', pad + cbW - 6, caY + cbH / 2);
+        } else if(cdFrac >= 1){
+            ctx.fillStyle = chCol2;
+            ctx.fillText('READY', pad + cbW - 6, caY + cbH / 2);
+        } else {
+            ctx.fillStyle = 'rgba(140,160,180,0.6)';
+            ctx.fillText((chassisCooldown / 60).toFixed(1) + 's', pad + cbW - 6, caY + cbH / 2);
+        }
+    }
+
     // ── XP / Level bar ───────────────────────────────────────────────────────
-    const xbW=300, xbH=12, xsl=5, xbX=pad, xbY=ebY+ebH+6;
+    const xbW=300, xbH=12, xsl=5, xbX=pad, xbY=caY+cbH+4;
     const xpFrac = Math.min(playerXP / xpForNextLevel(), 1);
     const xpCol  = '#ffdd00';
     ctx.fillStyle='rgba(0,7,16,0.80)'; slantedRect(xbX,xbY,xbW,xbH,xsl); ctx.fill();
@@ -9875,6 +10640,29 @@ function drawHUD(){
     ctx.textAlign='right';
     ctx.fillText(playerXP+' / '+xpForNextLevel()+' XP', xbX+xbW-6, xbY+xbH/2);
     const wp=WEAPONS[currentWeapon];
+
+    // ── Active run upgrades strip ─────────────────────────────────────────────
+    if(runUpgrades.length > 0){
+        const ruY = xbY + xbH + 5;
+        const uniqueIds = [...new Set(runUpgrades)];
+        let ruX = pad;
+        for(const id of uniqueIds){
+            const def2 = RUN_UPGRADE_DEFS.find(d=>d.id===id);
+            if(!def2) continue;
+            const cnt = runUpgrades.filter(x=>x===id).length;
+            const label = def2.icon + (cnt>1?' ×'+cnt:'');
+            ctx.font = 'bold 7px Orbitron';
+            const tw = ctx.measureText(label).width + 10;
+            ctx.fillStyle = def2.color+'33';
+            ctx.strokeStyle = def2.color+'88'; ctx.lineWidth = 1;
+            roundRect(ruX, ruY, tw, 14, 3); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = def2.color; ctx.textAlign='left'; ctx.textBaseline='middle';
+            ctx.shadowBlur=4; ctx.shadowColor=def2.color;
+            ctx.fillText(label, ruX+5, ruY+7); ctx.shadowBlur=0;
+            ruX += tw + 4;
+            if(ruX > pad + 280) break; // cap so it doesn't overflow
+        }
+    }
     const wsz=180, wpX=canvas.width-pad-wsz, wpY=canvas.height-pad-wsz-44;
     ctx.fillStyle='rgba(0,4,10,0.94)';
     ctx.strokeStyle=wp.color; ctx.lineWidth=2;
@@ -11071,7 +11859,7 @@ function toggleModifier(id){
 let diffMults = {
     enemyDmg:1, enemyHP:1, enemySpeed:1,
     shopCost:1, playerHPMult:1, playerDmgPenalty:1,
-    boostDrain:1, scrapMult:1, moduleDropMult:0.1,
+    boostDrain:1, scrapMult:1, moduleDropMult:0.3,
 };
 let inflationCount = 0;
 let shortCircuitJam = 0; // frames remaining on jam
@@ -11086,7 +11874,7 @@ function computeDiffMults(){
     diffMults.playerDmgPenalty  = d===0?1.0  :d===2?0.9  :1; // Assembly hurts player dmg
     diffMults.boostDrain        = d===0?0.9  :d===2?1.1  :1;
     diffMults.scrapMult         = hasMod2('depression')?0.5:1;
-    diffMults.moduleDropMult    = d===0?0.2  :d===2?0.05  :0.1;
+    diffMults.moduleDropMult    = d===0?0.45  :d===2?0.15  :0.3;
     inflationCount = 0;
     shortCircuitJam = 0;
 }
@@ -11122,8 +11910,8 @@ function applyDifficultyToRun(){
     if(hasMeta('get_harder_4')) getHarderBonus += 40;
     player.maxHealth = Math.round((100 + getHarderBonus) * diffMults.playerHPMult);
     player.health    = player.maxHealth;
-    // Feet Pics: +5% move speed
-    player.speed = 0.5 * (1 + (hasMeta('feet_pics') ? 0.05 : 0));
+    // Feet Pics: +5% move speed. Stroking Technique: +6% per stack
+    player.speed = 0.5 * (1 + (hasMeta('feet_pics') ? 0.05 : 0) + runUpgradeSpeedBonus());
     // Bigger Balls: +10% max energy per tier
     let ballsMult = 1;
     if(hasMeta('bigger_balls'))   ballsMult += 0.10;
@@ -11649,6 +12437,10 @@ const lobbyState = {
     // ── Sector Map panel ────────────────────────────────────────────────────
     mapOpen: false,
     mapTermX: 0, mapTermY: 0, mapTermPrompt: false,
+    // ── Chassis Select terminal ─────────────────────────────────────────────
+    chassisTermX: 0, chassisTermY: 0, chassisTermPrompt: false,
+    chassisSelectOpen: false,
+    chassisSelectIdx: 0,
 };
 
 const LOBBY_TIPS = [
@@ -11814,6 +12606,13 @@ function buildLobby(){
     lobbyState.mapTermX = cx + 240;
     lobbyState.mapTermY = cy - 180;
     lobbyState.mapTermPrompt = false;
+
+    // Chassis Select terminal — bottom row, right of upgrade terminal
+    lobbyState.chassisTermX = cx - 80;
+    lobbyState.chassisTermY = cy + 148;
+    lobbyState.chassisTermPrompt = false;
+    lobbyState.chassisSelectOpen = false;
+    lobbyState.chassisSelectIdx  = CHASSIS_LIST.indexOf(selectedChassis);
 }
 
 // ─── Update lobby ─────────────────────────────────────────────────────────────
@@ -11825,7 +12624,8 @@ function updateLobby(){
     // Movement — frozen while any panel/menu is open
     const anyMenuOpen = lobbyUpgradePanel || lobbyModPanel ||
         lobbyState.indexOpen || lobbyState.mapOpen ||
-        lobbyState.weaponBrowserOpen || lobbyState.rerollMenuOpen;
+        lobbyState.weaponBrowserOpen || lobbyState.rerollMenuOpen ||
+        lobbyState.chassisSelectOpen;
     if(!anyMenuOpen){
     if(keys['w']||keys['ArrowUp'])    player.momentumY-=player.speed;
     if(keys['s']||keys['ArrowDown'])  player.momentumY+=player.speed;
@@ -11947,6 +12747,7 @@ function updateLobby(){
     // ── Lobby device proximity ────────────────────────────────────────────────
     lobbyState.indexTermPrompt = Math.hypot(player.x-lobbyState.indexTermX, player.y-lobbyState.indexTermY) < TILE_SIZE*2.2;
     lobbyState.mapTermPrompt   = Math.hypot(player.x-lobbyState.mapTermX,   player.y-lobbyState.mapTermY)   < TILE_SIZE*2.2;
+    lobbyState.chassisTermPrompt = Math.hypot(player.x-lobbyState.chassisTermX, player.y-lobbyState.chassisTermY) < TILE_SIZE*2.2 && !lobbyState.chassisSelectOpen;
 
     // NPC proximity
     const npcDist=Math.hypot(player.x-lobbyState.npcX, player.y-lobbyState.npcY);
@@ -12046,7 +12847,6 @@ function drawLobby(){
 
     // ── Lobby interactive devices (Index + Map terminals) ───────────────────
     drawLobbyDevices(t);
-
     // ── Shooting range props + enemies ───────────────────────────────────────
     drawRangeRoom(t);
     if(lobbyState.inRange){ drawEnemies(); projectiles.forEach(p=>p.draw()); drawWeaponEffects(); }
@@ -12974,6 +13774,21 @@ function drawLobbyHUD(){
     ctx.shadowBlur=8; ctx.shadowColor='#ffaa00';
     ctx.fillText('◈ '+playerBlueprints, W-pad-190, pad+28); ctx.shadowBlur=0;
 
+    // ── Chassis badge — below difficulty badge ───────────────────────────────
+    {
+        const chDef3 = CHASSIS_DEFS[selectedChassis];
+        const chc3   = chDef3.color;
+        ctx.fillStyle='rgba(0,7,16,0.85)'; ctx.strokeStyle=chc3+'88'; ctx.lineWidth=1.5;
+        ctx.shadowBlur=6; ctx.shadowColor=chc3;
+        roundRect(pad-8, pad+44, 180, 28, 5); ctx.fill(); ctx.stroke(); ctx.shadowBlur=0;
+        ctx.fillStyle='rgba(160,180,200,0.5)'; ctx.font='bold 7px Orbitron';
+        ctx.textAlign='left'; ctx.textBaseline='middle';
+        ctx.fillText('CHASSIS', pad+4, pad+52);
+        ctx.fillStyle=chc3; ctx.font='bold 12px Orbitron';
+        ctx.shadowBlur=8; ctx.shadowColor=chc3;
+        ctx.fillText(selectedChassis, pad+8, pad+64); ctx.shadowBlur=0;
+    }
+
     // ── Modifier Panel (shown when M is pressed) ─────────────────────────────
     if(lobbyModPanel){
         drawModifierPanel();
@@ -13000,6 +13815,9 @@ function drawLobbyHUD(){
 
     // ── Sector Map Panel ─────────────────────────────────────────────────────
     if(lobbyState.mapOpen){ drawSectorMap(); }
+
+    // ── Chassis Select Panel ─────────────────────────────────────────────────
+    if(lobbyState.chassisSelectOpen){ drawChassisSelectPanel(); }
 
     // ── Range popup menus ────────────────────────────────────────────────────
     if(lobbyState.weaponBrowserOpen){ drawWeaponBrowserMenu(); }
@@ -13188,6 +14006,236 @@ function drawRerollMenu(){
         ctx.fillStyle='rgba(200,150,220,0.5)'; ctx.font='8px Orbitron';
         ctx.fillText('EQUIP A MODULE FIRST', cx, py+PH/2+20);
     }
+    ctx.textAlign='left'; ctx.textBaseline='alphabetic';
+}
+
+function drawChassisSelectPanel(){
+    const W=canvas.width, H=canvas.height, cx=W/2, cy=H/2;
+    const now=Date.now(), t=now/1000;
+
+    // Backdrop
+    ctx.fillStyle='rgba(0,4,16,0.96)';
+    ctx.fillRect(0,0,W,H);
+
+    // Panel
+    const PW=700, PH=380;
+    const px=cx-PW/2, py=cy-PH/2;
+    const panG=ctx.createLinearGradient(px,py,px,py+PH);
+    panG.addColorStop(0,'rgba(0,8,24,0.99)'); panG.addColorStop(1,'rgba(0,4,14,0.99)');
+    ctx.fillStyle=panG; ctx.strokeStyle='rgba(160,180,255,0.4)'; ctx.lineWidth=2;
+    ctx.shadowBlur=28; ctx.shadowColor='rgba(100,140,255,0.3)';
+    roundRect(px,py,PW,PH,10); ctx.fill(); ctx.stroke(); ctx.shadowBlur=0;
+
+    // Header
+    ctx.fillStyle='rgba(100,140,255,0.12)';
+    roundRect(px,py,PW,46,10); ctx.fill();
+    ctx.fillStyle='#aabbff'; ctx.font='bold 16px Orbitron';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.shadowBlur=14; ctx.shadowColor='#8899ff';
+    ctx.fillText('CHASSIS SELECT', cx, py+23); ctx.shadowBlur=0;
+    ctx.fillStyle='rgba(140,160,220,0.5)'; ctx.font='bold 8px Orbitron';
+    ctx.fillText('[◄/►] BROWSE   [E] CONFIRM   [ESC] CANCEL', cx, py+37);
+
+    // Divider
+    ctx.strokeStyle='rgba(100,140,255,0.3)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(px+20,py+46); ctx.lineTo(px+PW-20,py+46); ctx.stroke();
+
+    const sel = lobbyState.chassisSelectIdx;
+    const CARD_W = 140, CARD_H = 260, CARD_GAP = 20;
+    const totalW = CHASSIS_LIST.length * CARD_W + (CHASSIS_LIST.length - 1) * CARD_GAP;
+    const startX = cx - totalW/2;
+
+    CHASSIS_LIST.forEach((cid, ci) => {
+        const def = CHASSIS_DEFS[cid];
+        const col = def.color;
+        const isSelected = ci === sel;
+        const isActive   = cid === selectedChassis;
+        const isUnlocked = isChassisUnlocked(cid);
+        const cardX = startX + ci * (CARD_W + CARD_GAP);
+        const cardY = py + 62;
+        const pulse = Math.sin(t * 2.5 + ci * 1.2) * 0.4 + 0.6;
+
+        // Dim colour for locked cards
+        const displayCol = isUnlocked ? col : '#445566';
+
+        // Card bg
+        ctx.fillStyle = isSelected && isUnlocked ? col + '22' : 'rgba(8,14,28,0.9)';
+        ctx.strokeStyle = isSelected ? (isUnlocked ? col : '#556677') : displayCol + '44';
+        ctx.lineWidth = isSelected ? 2.5 : 1;
+        ctx.shadowBlur = isSelected && isUnlocked ? 18 + pulse*8 : 4;
+        ctx.shadowColor = displayCol;
+        roundRect(cardX, cardY, CARD_W, CARD_H, 7); ctx.fill(); ctx.stroke(); ctx.shadowBlur=0;
+
+        // Top accent stripe
+        ctx.fillStyle = displayCol + (isSelected ? 'cc' : '44');
+        roundRect(cardX, cardY, CARD_W, 6, 7); ctx.fill();
+
+        // Chassis name
+        ctx.fillStyle = isUnlocked ? col : '#667788';
+        ctx.font = 'bold 13px Orbitron';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.shadowBlur = isSelected && isUnlocked ? 10 : 4; ctx.shadowColor = displayCol;
+        ctx.fillText(def.name, cardX+CARD_W/2, cardY+22); ctx.shadowBlur=0;
+
+        if(isUnlocked){
+            // ── UNLOCKED: show full card content ─────────────────────────────
+
+            // Big rotating hex icon
+            ctx.save();
+            ctx.translate(cardX+CARD_W/2, cardY+80);
+            const spinSpeed = isSelected ? t * 1.2 : t * 0.35;
+            ctx.rotate(spinSpeed);
+            ctx.strokeStyle = col + (isSelected ? 'ee' : '88');
+            ctx.lineWidth = isSelected ? 2.5 : 1.5;
+            ctx.shadowBlur = isSelected ? 16+pulse*8 : 5; ctx.shadowColor = col;
+            ctx.beginPath();
+            for(let i=0;i<6;i++){
+                const a = i/6*Math.PI*2 - Math.PI/6;
+                if(i===0) ctx.moveTo(Math.cos(a)*30, Math.sin(a)*30);
+                else       ctx.lineTo(Math.cos(a)*30, Math.sin(a)*30);
+            }
+            ctx.closePath(); ctx.stroke();
+            ctx.lineWidth = 0.8; ctx.shadowBlur=0;
+            ctx.beginPath(); ctx.arc(0,0,18,0,Math.PI*2); ctx.stroke();
+            ctx.beginPath(); ctx.arc(0,0,8,0,Math.PI*2); ctx.stroke();
+            ctx.fillStyle = col + (isSelected ? '44' : '22');
+            ctx.beginPath(); ctx.arc(0,0,8,0,Math.PI*2); ctx.fill();
+            ctx.restore();
+
+            // Flavor desc
+            ctx.fillStyle = isSelected ? 'rgba(200,210,240,0.85)' : 'rgba(140,155,180,0.55)';
+            ctx.font = 'bold 7px Orbitron';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+            const words = def.flavorDesc.split(' ');
+            let line='', lines=[], lim=18;
+            for(const w of words){ if((line+w).length>lim){lines.push(line.trim());line='';} line+=w+' '; }
+            if(line.trim()) lines.push(line.trim());
+            lines.forEach((l,li) => ctx.fillText(l, cardX+CARD_W/2, cardY+120+li*10));
+
+            // Active ability box
+            const boxY = cardY+165;
+            ctx.fillStyle = isSelected ? col+'22' : 'rgba(4,8,18,0.7)';
+            ctx.strokeStyle = col + (isSelected ? '88' : '33');
+            ctx.lineWidth = 1;
+            roundRect(cardX+8, boxY, CARD_W-16, 58, 4); ctx.fill(); ctx.stroke();
+
+            ctx.fillStyle = col; ctx.font = 'bold 7px Orbitron';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.shadowBlur = isSelected?6:0; ctx.shadowColor=col;
+            ctx.fillText('[F] '+def.active, cardX+CARD_W/2, boxY+10); ctx.shadowBlur=0;
+
+            ctx.fillStyle = isSelected?'rgba(200,210,230,0.75)':'rgba(130,145,165,0.5)';
+            ctx.font = '6px Orbitron';
+            const adWords = def.activeDesc.split(' ');
+            let al='', alines=[], alim=20;
+            for(const w of adWords){ if((al+w).length>alim){alines.push(al.trim());al='';} al+=w+' '; }
+            if(al.trim()) alines.push(al.trim());
+            alines.slice(0,3).forEach((l,li) => ctx.fillText(l, cardX+CARD_W/2, boxY+22+li*9));
+
+            const cdSec = (def.cooldown/60).toFixed(0);
+            ctx.fillStyle = isSelected?col+'aa':col+'44'; ctx.font='bold 6px Orbitron';
+            ctx.fillText('CD: '+cdSec+'s', cardX+CARD_W/2, boxY+50);
+
+            // "EQUIPPED" badge
+            if(isActive){
+                ctx.fillStyle = col; ctx.font = 'bold 7px Orbitron';
+                ctx.shadowBlur = 10; ctx.shadowColor = col;
+                ctx.fillText('✔ EQUIPPED', cardX+CARD_W/2, cardY+CARD_H-10);
+                ctx.shadowBlur = 0;
+            }
+
+        } else {
+            // ── LOCKED: show padlock + unlock condition ────────────────────────
+
+            // Big padlock icon (drawn manually)
+            ctx.save();
+            ctx.translate(cardX+CARD_W/2, cardY+80);
+            // Lock body
+            ctx.fillStyle = '#223344';
+            ctx.strokeStyle = '#445566'; ctx.lineWidth = 2;
+            roundRect(-18, -4, 36, 28, 4); ctx.fill(); ctx.stroke();
+            // Lock shackle
+            ctx.beginPath();
+            ctx.arc(0, -4, 14, Math.PI, 0);
+            ctx.lineWidth = 4; ctx.strokeStyle = '#334455';
+            ctx.stroke();
+            // Keyhole
+            ctx.fillStyle = '#112233';
+            ctx.beginPath(); ctx.arc(0, 8, 5, 0, Math.PI*2); ctx.fill();
+            ctx.fillRect(-2, 10, 4, 8);
+            ctx.restore();
+
+            // Unlock requirement label
+            ctx.fillStyle = '#667788'; ctx.font = 'bold 7px Orbitron';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText('LOCKED', cardX+CARD_W/2, cardY+122);
+
+            ctx.strokeStyle = '#334455'; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(cardX+12,cardY+132); ctx.lineTo(cardX+CARD_W-12,cardY+132); ctx.stroke();
+
+            // Requirement text (word-wrapped, centered)
+            ctx.fillStyle = '#556677'; ctx.font = '6px Orbitron';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+            const reqText = chassisUnlockDesc(cid);
+            const reqWords = reqText.split(' ');
+            let rl='', rlines=[];
+            for(const w of reqWords){
+                const test = rl ? rl+' '+w : w;
+                ctx.font = '6px Orbitron';
+                if(ctx.measureText(test).width > CARD_W-24 && rl){ rlines.push(rl); rl=w; }
+                else rl=test;
+            }
+            if(rl) rlines.push(rl);
+            rlines.forEach((l,li)=> ctx.fillText(l, cardX+CARD_W/2, cardY+138+li*11));
+
+            // Progress bar for kill/scrap conditions
+            let progress = -1; // -1 = no bar needed
+            if(cid==='ENGINEER')  progress = Math.min(lifetimeKills / 100, 1);
+            if(cid==='SCAVENGER') progress = Math.min(lifetimeScrap / 10000, 1);
+            if(progress >= 0){
+                const barY = cardY+190, barW = CARD_W-24, barH = 8;
+                ctx.fillStyle = '#112233';
+                roundRect(cardX+12, barY, barW, barH, 3); ctx.fill();
+                if(progress > 0){
+                    ctx.fillStyle = '#334466';
+                    roundRect(cardX+12, barY, barW*progress, barH, 3); ctx.fill();
+                }
+                ctx.strokeStyle = '#334455'; ctx.lineWidth = 1;
+                roundRect(cardX+12, barY, barW, barH, 3); ctx.stroke();
+                ctx.fillStyle = '#556677'; ctx.font = 'bold 6px Orbitron';
+                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                ctx.fillText(Math.round(progress*100)+'%', cardX+CARD_W/2, barY+barH+7);
+            }
+
+            // Dim overlay so card looks clearly unavailable
+            ctx.fillStyle = 'rgba(0,4,12,0.45)';
+            roundRect(cardX, cardY, CARD_W, CARD_H, 7); ctx.fill();
+        }
+
+        // Arrow highlight on selected
+        if(isSelected){
+            const blink = Math.floor(t*3)%2===0;
+            ctx.fillStyle = blink ? (isUnlocked ? col : '#667788') : (isUnlocked ? col+'88' : '#445566');
+            ctx.font='bold 14px Orbitron';
+            ctx.textAlign='center'; ctx.textBaseline='middle';
+            if(ci > 0)                        ctx.fillText('◄', cardX - 16, cardY+CARD_H/2);
+            if(ci < CHASSIS_LIST.length - 1)  ctx.fillText('►', cardX+CARD_W+16, cardY+CARD_H/2);
+
+            // If locked and selected, show "LOCKED" confirm hint instead of normal one
+            if(!isUnlocked){
+                ctx.fillStyle = '#ff4444'; ctx.font='bold 8px Orbitron';
+                ctx.shadowBlur=8; ctx.shadowColor='#ff2222';
+                ctx.fillText('LOCKED — CANNOT SELECT', cardX+CARD_W/2, cardY+CARD_H+14);
+                ctx.shadowBlur=0;
+            }
+        }
+    });
+
+    // Bottom hint
+    ctx.fillStyle='rgba(120,140,180,0.5)'; ctx.font='bold 8px Orbitron';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('CHASSIS ABILITY ACTIVATES WITH [F] DURING A RUN', cx, py+PH-14);
+
     ctx.textAlign='left'; ctx.textBaseline='alphabetic';
 }
 
@@ -14286,6 +15334,131 @@ function drawLobbyDevices(t){
     ctx.restore();
 
     ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  CHASSIS SELECT TERMINAL — sleek console with rotating chassis icon
+    // ════════════════════════════════════════════════════════════════════════
+    ctx.save(); ctx.translate(lobbyState.chassisTermX, lobbyState.chassisTermY);
+    const chDef   = CHASSIS_DEFS[selectedChassis];
+    const chCol   = chDef.color;
+    const chActive= lobbyState.chassisTermPrompt;
+    const chPulse = Math.sin(t * 2.4 + 0.8) * 0.4 + 0.6;
+    const chGlow  = chActive ? 18 + chPulse * 8 : 5;
+
+    // Shadow
+    ctx.globalAlpha = 0.22;
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.ellipse(0, 30, 18, 5, 0, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Base pedestal
+    ctx.fillStyle = '#080e1a'; ctx.strokeStyle = '#18283a'; ctx.lineWidth = 1.5;
+    roundRect(-14, 22, 28, 10, 3); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#060b14';
+    roundRect(-16, 28, 10, 5, 2); ctx.fill();
+    roundRect(6,   28, 10, 5, 2); ctx.fill();
+
+    // Cabinet
+    ctx.fillStyle = '#0c1826'; ctx.strokeStyle = chCol + (chActive ? 'aa' : '44');
+    ctx.lineWidth = 1.5; ctx.shadowBlur = chGlow; ctx.shadowColor = chCol + '88';
+    roundRect(-15, -6, 30, 30, 4); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+
+    // Side rivets
+    for(const sx of [-12, 12]){
+        ctx.fillStyle = '#1a2a3a';
+        for(const sy of [0, 12]) { ctx.beginPath(); ctx.arc(sx, sy, 1.4, 0, Math.PI*2); ctx.fill(); }
+    }
+
+    // Screen
+    ctx.fillStyle = '#040c16'; ctx.strokeStyle = chCol + (chActive ? 'cc' : '55');
+    ctx.lineWidth = 1.2; ctx.shadowBlur = chActive ? 10 : 2; ctx.shadowColor = chCol;
+    roundRect(-11, -3, 22, 20, 3); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+
+    // Screen glow
+    const scrG2 = ctx.createLinearGradient(-11,-3,-11,17);
+    scrG2.addColorStop(0, chCol + '22'); scrG2.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = scrG2; roundRect(-11,-3,22,20,3); ctx.fill();
+
+    // Scanline sweep
+    ctx.fillStyle = chCol + '18';
+    ctx.fillRect(-11, -3 + ((t * 24) % 20), 22, 2);
+
+    // Chassis icon — rotating hexagon with label
+    ctx.save();
+    ctx.translate(0, 7);
+    ctx.rotate(t * 0.6);
+    ctx.strokeStyle = chCol + (chActive ? 'cc' : '88');
+    ctx.lineWidth = 1.2;
+    ctx.shadowBlur = chActive ? 8 : 3; ctx.shadowColor = chCol;
+    ctx.beginPath();
+    for(let i = 0; i < 6; i++){
+        const a = i / 6 * Math.PI * 2 - Math.PI/6;
+        if(i === 0) ctx.moveTo(Math.cos(a)*7, Math.sin(a)*7);
+        else         ctx.lineTo(Math.cos(a)*7, Math.sin(a)*7);
+    }
+    ctx.closePath(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // Chassis name, clipped to screen
+    ctx.save();
+    ctx.beginPath(); roundRect(-11,-3,22,20,3); ctx.clip();
+    ctx.fillStyle = chCol; ctx.font = 'bold 5px Orbitron';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowBlur = 4; ctx.shadowColor = chCol;
+    ctx.fillText(selectedChassis.slice(0,7), 0, 15);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // Header marquee
+    ctx.fillStyle = '#070d1c'; ctx.strokeStyle = chCol + '77'; ctx.lineWidth = 1;
+    roundRect(-15, -24, 30, 19, 3); ctx.fill(); ctx.stroke();
+    const cMarqueePhase = (t * 18) % 30;
+    ctx.save();
+    ctx.beginPath(); roundRect(-13, -22, 26, 15, 2); ctx.clip();
+    ctx.fillStyle = chCol; ctx.font = 'bold 5px Orbitron';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.shadowBlur = 3; ctx.shadowColor = chCol;
+    ctx.fillText('CHASSIS ✦ ', -cMarqueePhase, -15);
+    ctx.fillText('CHASSIS ✦ ', 30 - cMarqueePhase, -15);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    // LED dots
+    ctx.fillStyle = chActive ? chCol : chCol + '44';
+    ctx.shadowBlur = chActive ? 6 : 0; ctx.shadowColor = chCol;
+    for(let li = -12; li <= 12; li += 4){ ctx.beginPath(); ctx.arc(li, -26, 1.1, 0, Math.PI*2); ctx.fill(); }
+    ctx.shadowBlur = 0;
+
+    // Button row
+    ctx.fillStyle = '#060c18'; ctx.strokeStyle = '#121e2e'; ctx.lineWidth = 1;
+    roundRect(-11, 18, 22, 5, 2); ctx.fill(); ctx.stroke();
+    [chCol, '#ffffff', '#444466'].forEach((bc, bi) => {
+        ctx.fillStyle = bc; ctx.shadowBlur = chActive ? 4 : 0; ctx.shadowColor = bc;
+        ctx.beginPath(); ctx.arc(-5 + bi * 5, 20.5, 1.5, 0, Math.PI*2); ctx.fill();
+    });
+    ctx.shadowBlur = 0;
+
+    // Interact prompt
+    if(chActive){
+        const pb2 = Math.floor(t * 2) % 2 === 0;
+        ctx.fillStyle = pb2 ? 'rgba(255,255,255,0.9)' : chCol + 'cc';
+        ctx.font = 'bold 6px Orbitron'; ctx.textAlign = 'center';
+        ctx.shadowBlur = 6; ctx.shadowColor = chCol;
+        ctx.fillText('[E] SELECT', 0, -38);
+        ctx.shadowBlur = 0;
+    }
+
+    // Small lock badge showing how many chassis are unlocked
+    const unlockedCount = CHASSIS_LIST.filter(id => isChassisUnlocked(id)).length;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.strokeStyle = chCol+'55'; ctx.lineWidth=0.8;
+    roundRect(-14, 26, 28, 9, 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = unlockedCount < CHASSIS_LIST.length ? '#ffaa44' : chCol;
+    ctx.font = 'bold 5px Orbitron'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(unlockedCount+'/'+CHASSIS_LIST.length+' UNLOCKED', 0, 30.5);
+
+    ctx.restore();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
 }
 
 function handleLobbyKey(key){
@@ -14295,6 +15468,7 @@ function handleLobbyKey(key){
     if(key==='Escape'){
         if(lobbyState.weaponBrowserOpen){ lobbyState.weaponBrowserOpen=false; return; }
         if(lobbyState.rerollMenuOpen)   { lobbyState.rerollMenuOpen=false;    return; }
+        if(lobbyState.chassisSelectOpen){ lobbyState.chassisSelectOpen=false; return; }
         if(lobbyState.indexOpen){ lobbyState.indexOpen=false; return; }
         if(lobbyState.mapOpen)  { lobbyState.mapOpen=false;   return; }
         if(lobbyModPanel)       { lobbyModPanel=false;         return; }
@@ -14338,6 +15512,28 @@ function handleLobbyKey(key){
                 moduleSlotData[activeModuleSlot]={...slotD,mods:newMods};
                 spawnDamageText(player.x,player.y-44,'MODS REROLLED!','#cc44ff');
             }
+            return;
+        }
+        return;
+    }
+    // ── Chassis select panel keys ─────────────────────────────────────────────
+    if(lobbyState.chassisSelectOpen){
+        if(key==='ArrowLeft' ||key==='a'||key==='A'){
+            lobbyState.chassisSelectIdx=(lobbyState.chassisSelectIdx-1+CHASSIS_LIST.length)%CHASSIS_LIST.length; return;
+        }
+        if(key==='ArrowRight'||key==='d'||key==='D'){
+            lobbyState.chassisSelectIdx=(lobbyState.chassisSelectIdx+1)%CHASSIS_LIST.length; return;
+        }
+        if(key==='Enter'||key==='e'||key==='E'){
+            const chosen = CHASSIS_LIST[lobbyState.chassisSelectIdx];
+            if(!isChassisUnlocked(chosen)){
+                // Flash the lock message via damage text on player position (panel is open so it won't be seen, but the panel handles it visually)
+                return;
+            }
+            selectedChassis=chosen;
+            lobbyState.chassisSelectOpen=false;
+            saveGame();
+            spawnDamageText(player.x,player.y-50,'CHASSIS: '+selectedChassis,'#ffffff');
             return;
         }
         return;
@@ -14398,6 +15594,13 @@ function handleLobbyKey(key){
 
         // Sector Map terminal → open map
         if(lobbyState.mapTermPrompt){ lobbyState.mapOpen=true; return; }
+
+        // Chassis select terminal → open chassis panel
+        if(lobbyState.chassisTermPrompt){
+            lobbyState.chassisSelectOpen=true;
+            lobbyState.chassisSelectIdx=CHASSIS_LIST.indexOf(selectedChassis);
+            return;
+        }
 
         // NPC → toggle modifier panel
         if(lobbyState.npcPrompt){ lobbyModPanel=!lobbyModPanel; return; }
