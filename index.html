@@ -3220,7 +3220,7 @@ class Boss {
                     camera.x+=(Math.random()-.5)*14; camera.y+=(Math.random()-.5)*14;
                 }
             } else { v.jumpTimer--; if(v.jumpTimer<=0) v.jumpState='ground'; }
-        } if(p>=2) {
+        } if(p>=1) {
             // Phase 1 & 2: Circle orbit + shard arcs
             this._orbitTarget(player.x,player.y,190+(p===2?-30:0),0.016+(p===2?0.01:0));
             this.angle+=(this.aimAngle-this.angle)*(p===2?0.09:0.06);
