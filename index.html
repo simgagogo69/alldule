@@ -796,7 +796,7 @@ function spawnShopVendors(room){
     const cy = room.cy * TILE_SIZE;
     const offsets = [{dx:-48,dy:0},{dx:48,dy:0}];
 
-    for(let i=0;i<2;i++){
+    for(let i=0;i<picked.length;i++){
         const vType = picked[i];
         let stock = null;
         if(vType === 'CRATE_MASTER_ZOG'){
@@ -3705,15 +3705,15 @@ function activateChassisAbility(){
         const maxD = def.maxDrones + (engineerDroneSlotsBonus||0);
         const alive = engineerDrones.filter(d=>!d.dead).length;
         if(alive >= maxD){ spawnDamageText(player.x,player.y-40,'DRONE SLOTS FULL!',def.color); return; }
-        const angle = Math.random()*Math.PI*2;
+        const spawnPos = findValidDroneSpawnPos();
         engineerDrones.push({
-            x: player.x + Math.cos(angle)*36,
-            y: player.y + Math.sin(angle)*36,
+            x: spawnPos.x,
+            y: spawnPos.y,
             vx:0, vy:0,
             hp:30, maxHp:30,
             dead:false, age:0,
             shootTimer:0, shootCooldown:60,
-            orbitAngle: angle,
+            orbitAngle: Math.atan2(spawnPos.y-player.y, spawnPos.x-player.x),
             deathTimer:20,
         });
         spawnDamageText(player.x, player.y-40, 'DRONE DEPLOYED!', def.color);
@@ -3767,6 +3767,29 @@ function activateChassisAbility(){
 }
 
 let engineerDroneSlotsBonus = 0; // could be upgraded later
+
+// ── Find a valid open-floor position near the player for drone spawning ────────
+function findValidDroneSpawnPos(){
+    // Try 16 directions at a couple of distances; fall back to player pos if all blocked
+    for(let ring=0; ring<3; ring++){
+        const dist = 35 + ring*20;
+        for(let k=0; k<16; k++){
+            const ang = (k/16)*Math.PI*2;
+            const tx = player.x + Math.cos(ang)*dist;
+            const ty = player.y + Math.sin(ang)*dist;
+            const tileX = Math.floor(tx/TILE_SIZE);
+            const tileY = Math.floor(ty/TILE_SIZE);
+            let ok = true;
+            for(let dy2=-1; dy2<=1&&ok; dy2++)
+                for(let dx2=-1; dx2<=1&&ok; dx2++){
+                    const t = map[tileY+dy2]?.[tileX+dx2];
+                    if(t!==T_FLOOR && t!==T_DOOR) ok=false;
+                }
+            if(ok) return {x:tx, y:ty};
+        }
+    }
+    return {x:player.x, y:player.y};
+}
 
 // ── Big Capacity: scale a weapon's maxAmmo by the current run upgrade mult ───
 // Called when the upgrade is picked AND at run start (via recalcRunUpgradeAmmo)
@@ -4916,12 +4939,14 @@ function thrustCheckEnemies(ox, oy, angle, reach, dmg, hitboxR){
             wState.thrustHitSet.add(e);
         }
     }
-    // Also hit boss
-    if(activeBoss&&!activeBoss.dead){
+    // Also hit boss — guarded by thrustHitSet so it only takes damage once per thrust
+    if(activeBoss&&!activeBoss.dead&&!wState.thrustHitSet.has(activeBoss)){
         const bt=Math.max(0,Math.min(reach,(activeBoss.x-ox)*dx+(activeBoss.y-oy)*dy));
         const bcx=ox+dx*bt, bcy=oy+dy*bt;
-        if(Math.hypot(activeBoss.x-bcx,activeBoss.y-bcy)<activeBoss.size+hitboxR)
+        if(Math.hypot(activeBoss.x-bcx,activeBoss.y-bcy)<activeBoss.size+hitboxR){
             activeBoss.takeDamage(dmg, bcx, bcy);
+            wState.thrustHitSet.add(activeBoss);
+        }
     }
 }
 
@@ -7440,75 +7465,69 @@ function updateReload(){
 
 function castPrismRay(ox,oy,angle,maxLen){
     const dx=Math.cos(angle), dy=Math.sin(angle);
-    let hx=ox+dx*maxLen, hy=oy+dy*maxLen;
-    let hitX=null,hitY=null,nx=0,ny=0;
-    
-    // Segment 1: cast forward until hitting a wall
-    for(let i=8;i<maxLen;i+=4){
-        const cx=ox+dx*i, cy=oy+dy*i;
-        const tx=Math.floor(cx/TILE_SIZE);
-        const ty=Math.floor(cy/TILE_SIZE);
-        const t=map[ty]?.[tx];
-        if(t===T_WALL||t===T_VOID){
-            hx=cx; hy=cy; hitX=cx; hitY=cy;
-            
-            // Check adjacent tiles (not pixels) to determine wall orientation
-            const checkLeft=map[ty]?.[tx-1];
-            const checkRight=map[ty]?.[tx+1];
-            const checkUp=map[ty-1]?.[tx];
-            const checkDown=map[ty+1]?.[tx];
-            
-            const isWallLeft=(checkLeft===T_WALL||checkLeft===T_VOID);
-            const isWallRight=(checkRight===T_WALL||checkRight===T_VOID);
-            const isWallUp=(checkUp===T_WALL||checkUp===T_VOID);
-            const isWallDown=(checkDown===T_WALL||checkDown===T_VOID);
-            
-            // Determine which side is OPEN (came from that direction)
-            const cameFromLeft=!isWallLeft;
-            const cameFromRight=!isWallRight;
-            const cameFromUp=!isWallUp;
-            const cameFromDown=!isWallDown;
-            
-            // Set normal based on open side
-            if(cameFromLeft && !cameFromRight) { nx=1; ny=0; }      // came from left, hit right face
-            else if(cameFromRight && !cameFromLeft) { nx=-1; ny=0; } // came from right, hit left face
-            else if(cameFromUp && !cameFromDown) { nx=0; ny=1; }     // came from up, hit bottom face
-            else if(cameFromDown && !cameFromUp) { nx=0; ny=-1; }    // came from down, hit top face
-            else if(cameFromLeft && cameFromUp) { nx=1; ny=1; }      // corner
-            else if(cameFromRight && cameFromUp) { nx=-1; ny=1; }
-            else if(cameFromLeft && cameFromDown) { nx=1; ny=-1; }
-            else if(cameFromRight && cameFromDown) { nx=-1; ny=-1; }
-            else { nx=1; ny=0; } // default
-            
-            // Normalize
-            const nlen=Math.hypot(nx,ny)||1;
-            nx/=nlen; ny/=nlen;
-            break;
+
+    // DDA-style march: track which tile boundary we cross to get reliable normals
+    function marchRay(startX, startY, rdx, rdy, maxDist){
+        let prevTX=Math.floor(startX/TILE_SIZE), prevTY=Math.floor(startY/TILE_SIZE);
+        for(let i=6; i<maxDist; i+=3){
+            const cx=startX+rdx*i, cy=startY+rdy*i;
+            const tileX=Math.floor(cx/TILE_SIZE), tileY=Math.floor(cy/TILE_SIZE);
+            const t=map[tileY]?.[tileX];
+            if(t===T_WALL||t===T_VOID){
+                const crossX=(tileX!==prevTX), crossY=(tileY!==prevTY);
+                let nx=0, ny=0;
+                if(crossX && !crossY){
+                    nx=-Math.sign(rdx); ny=0;
+                } else if(crossY && !crossX){
+                    nx=0; ny=-Math.sign(rdy);
+                } else {
+                    // Corner — check which adjacent cell is walkable to pick dominant face
+                    const tSameY=map[prevTY]?.[tileX];
+                    const tSameX=map[tileY]?.[prevTX];
+                    const xFaceWall=(tSameY===T_WALL||tSameY===T_VOID);
+                    const yFaceWall=(tSameX===T_WALL||tSameX===T_VOID);
+                    if(xFaceWall && !yFaceWall){ nx=0; ny=-Math.sign(rdy); }
+                    else if(yFaceWall && !xFaceWall){ nx=-Math.sign(rdx); ny=0; }
+                    else {
+                        // True corner — retro-reflect both axes
+                        nx=-Math.sign(rdx); ny=-Math.sign(rdy);
+                        const nlen=Math.hypot(nx,ny)||1; nx/=nlen; ny/=nlen;
+                    }
+                }
+                return {hitX:cx, hitY:cy, nx, ny};
+            }
+            prevTX=tileX; prevTY=tileY;
         }
+        return null;
     }
-    
-    const seg1={x1:ox,y1:oy,x2:hx,y2:hy};
-    if(hitX===null) return {segs:[seg1],crit:false};
-    
+
+    const hit1=marchRay(ox, oy, dx, dy, maxLen);
+    const endX=ox+dx*maxLen, endY=oy+dy*maxLen;
+    const seg1={x1:ox, y1:oy, x2:hit1?hit1.hitX:endX, y2:hit1?hit1.hitY:endY};
+    if(!hit1) return {segs:[seg1], crit:false};
+
+    const {hitX, hitY, nx, ny}=hit1;
+
     // Reflect direction
     const dot=dx*nx+dy*ny;
     const rdx=dx-2*dot*nx, rdy=dy-2*dot*ny;
-    
-    // Crit when perpendicular hit (dot product near 0)
-    const crit=Math.abs(dot)<(WEAPONS[currentWeapon].cleanAngleThresh||0.25);
-    
-    // Segment 2
-    let ex=hitX+rdx*maxLen, ey=hitY+rdy*maxLen;
+
+    // Crit = retroreflection: reflected ray travels back toward the shooter
+    // retroDot close to -1 means ray nearly reverses; give comfortable margin
+    const retroDot=rdx*dx+rdy*dy;
+    const crit=retroDot < -0.10;
+
+    // Segment 2 — start slightly offset from wall so we don't re-enter it
     const remaining=maxLen*0.75;
-    for(let i=4;i<remaining;i+=4){
+    let ex=hitX+rdx*remaining, ey=hitY+rdy*remaining;
+    for(let i=8; i<remaining; i+=4){
         const cx2=hitX+rdx*i, cy2=hitY+rdy*i;
-        const tx2=Math.floor(cx2/TILE_SIZE);
-        const ty2=Math.floor(cy2/TILE_SIZE);
+        const tx2=Math.floor(cx2/TILE_SIZE), ty2=Math.floor(cy2/TILE_SIZE);
         const t2=map[ty2]?.[tx2];
         if(t2===T_WALL||t2===T_VOID){ ex=cx2; ey=cy2; break; }
     }
-    const seg2={x1:hitX,y1:hitY,x2:ex,y2:ey};
-    return {segs:[seg1,seg2],crit,reflectAngle:Math.atan2(rdy,rdx),hitX,hitY};
+    const seg2={x1:hitX, y1:hitY, x2:ex, y2:ey};
+    return {segs:[seg1,seg2], crit, reflectAngle:Math.atan2(rdy,rdx), hitX, hitY};
 }
 
 function randomFrom(arr) {
@@ -8019,7 +8038,7 @@ function firePreciseRail(wp){ // ── Prism Rail
             if(Math.hypot(e.x-cx3,e.y-cy3)<e.size+10){
                 const wpHit=segmentHitsWeakpoint(e,seg.x1,seg.y1,seg.x2,seg.y2);
                 let finalDmg=baseDmg;
-                if(wpHit) finalDmg*=2 + runUpgradeCritMult;
+                if(wpHit) finalDmg*=2 + runUpgradeCritMult();
                 e.takeDamage(finalDmg);
                 if(wpHit) triggerWeakpointEffect(e);
             }
@@ -8531,7 +8550,7 @@ function updateWeapons(){
                     spawnDamageText(closestX,closestY-20+(Math.random()-.5)*8,'▲ WP x'+wState.needleStack,sc);
                     triggerWeakpointEffect(e);
                 }
-                const needleDmg=wpHit?(15+wState.needleStack*5)*2 + runUpgradeCritMult:15;
+                const needleDmg=wpHit?(15+wState.needleStack*5)*2 + runUpgradeCritMult():15;
                 e.takeDamage(needleDmg);
                 // Spark burst on impact at closest point
                 for(let p=0;p<5;p++){
@@ -8618,7 +8637,7 @@ function updateWeapons(){
                     if(Math.random()<0.5){
                         const wpHit=rayHitsWeakpoint(e,player.x,player.y,player.angle,wp.beamLength);
                         if(wpHit){
-                            e.takeDamage(trackDmg*2 + runUpgradeCritMult);
+                            e.takeDamage(trackDmg*2 + runUpgradeCritMult());
                             triggerWeakpointEffect(e);
                         } else {
                             e.takeDamage(trackDmg);
@@ -9542,6 +9561,14 @@ function updateTransition(){
         }
         sectorsCleared++; // count each sector we leave
         generateWorld(trans.targetNode);
+        // Relocate any surviving engineer drones to a valid floor spot near the player
+        for(const d of engineerDrones){
+            if(!d.dead){
+                const pos = findValidDroneSpawnPos();
+                d.x=pos.x; d.y=pos.y; d.vx=0; d.vy=0;
+                d.orbitAngle = Math.atan2(pos.y-player.y, pos.x-player.x);
+            }
+        }
         trans.worldSwapped=true;
     }
     if(trans.t>=TRANS_TOTAL) trans.active=false;
@@ -13157,8 +13184,8 @@ function drawLobbyProps(t){
     const tipFade=Math.min(1,lobbyState.tipTimer/40)*Math.min(1,(300-lobbyState.tipTimer)/20||1);
     const tipBob=Math.sin(t*1.5)*2;
     let usedTip = LOBBY_TIPS[lobbyState.tipIndex]
-    const tw=ctx.measureText(usedTip).width + 30;
-    const pw=(tw / 2)-90
+    const tw=ctx.measureText(usedTip).width + 50;
+    const pw=(tw / 2)
     ctx.save(); ctx.translate(cx-140, cy-155+tipBob); ctx.globalAlpha=0.75*tipFade;
     ctx.fillStyle='rgba(0,14,30,0.85)';
     ctx.strokeStyle='rgba(0,150,220,0.6)'; ctx.lineWidth=1;
